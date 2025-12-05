@@ -5,15 +5,22 @@ const path = require('path');
 
 async function generateStoreReport(req, res) {
   try {
-    const storeId = req.params.id;
-    const store = await db.Store.findByPk(storeId);
+    const storeId = Number(req.params.id);
+    if (!storeId) return res.status(404).json({ error: 'Invalid store id' });
 
+    const store = await db.Store.findByPk(storeId);
     if (!store) return res.status(404).json({ error: 'Store not found' });
 
     // Top 5 priciest books
     const topBooks = await db.StoreBook.findAll({
       where: { store_id: storeId },
-      include: [{ model: db.Book, include: [db.Author] }],
+      include: [
+        {
+          model: db.Book,
+          as: 'Book',
+          include: [{ model: db.Author, as: 'Author' }],
+        },
+      ],      
       order: [['price', 'DESC']],
       limit: 5,
     });
@@ -23,57 +30,82 @@ async function generateStoreReport(req, res) {
       include: [
         {
           model: db.Store,
+          as: 'Stores',
           where: { id: storeId },
           through: { attributes: [] },
         },
-        db.Author,
+        { model: db.Author, as: 'Author' },
       ],
     });
 
     const authorCounts = {};
-    authors.forEach((book) => {
-      const name = book.Author.name;
-      authorCounts[name] = (authorCounts[name] || 0) + 1;
+    booksInStore.forEach((b) => {
+      const auth = b.Author;
+      if (!auth) return;
+      const key = `${auth.id}::${auth.name}`;
+      authorCounts[key] = (authorCounts[key] || 0) + 1;
     });
 
     const topAuthors = Object.entries(authorCounts)
-      .sort((a, b) => b[1] - a[1])
+      .map(([k, count]) => {
+        const [, name] = k.split('::');
+        return { name, count };
+      })
+      .sort((a, b) => b.count - a.count)
       .slice(0, 5);
 
-    // Generate PDF
-    const doc = new PDFDocument();
-    const filename = `${store.name}-Report-${new Date()
-      .toISOString()
-      .split('T')[0]}.pdf`;
+    const filename = `${store.name.replace(/[^a-z0-9_-]/gi, '_')}-Report-${new Date().toISOString().split('T')[0]}.pdf`;
     const filepath = path.join(__dirname, '../../reports', filename);
 
-    // Ensure reports folder exists
-    fs.mkdirSync(path.join(__dirname, '../../reports'), { recursive: true });
+    const doc = new PDFDocument({ margin: 40 });
+    const writeStream = fs.createWriteStream(filepath);
+    doc.pipe(writeStream);
 
-    doc.pipe(fs.createWriteStream(filepath));
+    doc.fontSize(18).text(`Store Report: ${store.name}`, { align: 'center' });
+    doc.moveDown(1);
 
-    doc.fontSize(20).text(`Store Report: ${store.name}`, { align: 'center' });
-    doc.moveDown();
+    doc.fontSize(14).text('Top 5 Priciest Books:', { underline: true });
+    doc.moveDown(0.5);
+    if (topBooks.length === 0) {
+      doc.text('No books found for this store.');
+    } else {
+      topBooks.forEach((sb, i) => {
+        const book = sb.Book || {};
+        const author = book.Author || {};
+        doc.text(`${i + 1}. ${book.name || 'N/A'} by ${author.name || 'N/A'} — $${Number(sb.price).toFixed(2)} (copies: ${sb.copies})`);
+      });
+    }
 
-    doc.fontSize(16).text('Top 5 Priciest Books:');
-    topBooks.forEach((sb, i) => {
-      doc.text(
-        `${i + 1}. ${sb.Book.name} by ${sb.Book.Author.name} - $${sb.price}`
-      );
-    });
-    doc.moveDown();
-
-    doc.fontSize(16).text('Top 5 Prolific Authors:');
-    topAuthors.forEach(([name, count], i) => {
-      doc.text(`${i + 1}. ${name} - ${count} book(s)`);
-    });
+    doc.moveDown(1.2);
+    doc.fontSize(14).text('Top 5 Prolific Authors:', { underline: true });
+    doc.moveDown(0.5);
+    if (topAuthors.length === 0) {
+      doc.text('No authors found for this store.');
+    } else {
+      topAuthors.forEach((a, i) => {
+        doc.text(`${i + 1}. ${a.name} — ${a.count} book(s)`);
+      });
+    }
 
     doc.end();
 
-    res.download(filepath, filename);
+    // Wait until file write is finished then send
+    writeStream.on('finish', () => {
+      res.download(filepath, filename, (err) => {
+        if (err) {
+          console.error('Download error:', err);
+          res.status(500).end();
+        }
+      });
+    });
+
+    writeStream.on('error', (err) => {
+      console.error('Write stream error:', err);
+      res.status(500).json({ error: 'Failed to generate PDF' });
+    });
   } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: 'Server error' });
+    console.error('Report generation error:', err);
+    res.status(500).json({ error: 'Server error generating report' });
   }
 }
 
